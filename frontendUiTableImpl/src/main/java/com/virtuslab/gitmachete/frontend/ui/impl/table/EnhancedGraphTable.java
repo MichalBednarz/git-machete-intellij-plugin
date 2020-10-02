@@ -34,8 +34,6 @@ import com.intellij.openapi.actionSystem.DataContext;
 import com.intellij.openapi.actionSystem.DataProvider;
 import com.intellij.openapi.actionSystem.Presentation;
 import com.intellij.openapi.application.ApplicationManager;
-import com.intellij.openapi.progress.ProgressIndicator;
-import com.intellij.openapi.progress.Task;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.vcs.VcsNotifier;
 import com.intellij.openapi.vfs.VfsUtil;
@@ -49,7 +47,6 @@ import git4idea.repo.GitRepository;
 import git4idea.repo.GitRepositoryChangeListener;
 import io.vavr.collection.List;
 import io.vavr.control.Option;
-import io.vavr.control.Try;
 import lombok.CustomLog;
 import lombok.Getter;
 import lombok.Setter;
@@ -58,9 +55,7 @@ import org.checkerframework.checker.guieffect.qual.UIEffect;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 import com.virtuslab.binding.RuntimeBinding;
-import com.virtuslab.branchlayout.api.BranchLayoutException;
 import com.virtuslab.branchlayout.api.readwrite.IBranchLayoutReader;
-import com.virtuslab.gitmachete.backend.api.IGitMacheteRepositoryCache;
 import com.virtuslab.gitmachete.backend.api.IGitMacheteRepositorySnapshot;
 import com.virtuslab.gitmachete.frontend.datakeys.DataKeys;
 import com.virtuslab.gitmachete.frontend.defs.ActionGroupIds;
@@ -72,7 +67,6 @@ import com.virtuslab.gitmachete.frontend.ui.api.gitrepositoryselection.IGitRepos
 import com.virtuslab.gitmachete.frontend.ui.api.table.BaseEnhancedGraphTable;
 import com.virtuslab.gitmachete.frontend.ui.impl.cell.BranchOrCommitCell;
 import com.virtuslab.gitmachete.frontend.ui.impl.cell.BranchOrCommitCellRenderer;
-import com.virtuslab.gitmachete.frontend.ui.providerservice.BranchLayoutWriterProvider;
 import com.virtuslab.gitmachete.frontend.ui.providerservice.SelectedGitRepositoryProvider;
 import com.virtuslab.gitmachete.frontend.vfsutils.GitVfsUtils;
 
@@ -181,7 +175,7 @@ public final class EnhancedGraphTable extends BaseEnhancedGraphTable
       if (gitMacheteRepositorySnapshot.getRootBranches().isEmpty()) {
         if (gitMacheteRepositorySnapshot.getSkippedBranchNames().isEmpty()) {
           LOG.info("Machete file (${macheteFilePath}) is empty, so auto discover is running");
-          doAutomaticDiscover(macheteFilePath);
+          doDiscover(macheteFilePath);
         } else {
           setTextForEmptyTable(
               format(getString("string.GitMachete.EnhancedGraphTable.empty-table-text.only-skipped-in-machete-file"),
@@ -192,7 +186,7 @@ public final class EnhancedGraphTable extends BaseEnhancedGraphTable
 
     if (!isMacheteFilePresent) {
       LOG.info("Machete file (${macheteFilePath}) is absent, so auto discover is running");
-      doAutomaticDiscover(macheteFilePath);
+      doDiscover(macheteFilePath);
     }
 
     setModel(new GraphTableModel(repositoryGraph));
@@ -209,67 +203,35 @@ public final class EnhancedGraphTable extends BaseEnhancedGraphTable
   }
 
   @UIEffect
-  private void doAutomaticDiscover(Path macheteFilePath) {
-    var selectedRepository = getGitRepositorySelectionProvider().getSelectedGitRepository().getOrNull();
-    if (selectedRepository == null) {
-      LOG.error("Can't do automatic discover because of undefined selected repository");
-      return;
-    }
-    var mainDirPath = GitVfsUtils.getMainDirectoryPath(selectedRepository).toAbsolutePath();
-    var gitDirPath = GitVfsUtils.getGitDirectoryPath(selectedRepository).toAbsolutePath();
+  private void doDiscover(Path macheteFilePath) {
+    new GitMacheteRepositoryDiscoverer(
+        project,
+        getGitRepositorySelectionProvider(),
+        getUnsuccessfulDiscoverMacheteFilePathConsumer(),
+        getSuccessfulDiscoverRepositoryConsumer())
+            .doDiscover(macheteFilePath);
+  }
 
-    new Task.Backgroundable(project, getString("string.GitMachete.EnhancedGraphTable.automatic-discover.task-title")) {
-      @Override
-      public void run(ProgressIndicator indicator) {
-        var discoverRunResult = Try.of(() -> RuntimeBinding.instantiateSoleImplementingClass(IGitMacheteRepositoryCache.class)
-            .getInstance(mainDirPath, gitDirPath).discoverLayoutAndCreateSnapshot());
+  @UIEffect
+  private Consumer<IGitMacheteRepositorySnapshot> getSuccessfulDiscoverRepositoryConsumer() {
+    return (IGitMacheteRepositorySnapshot repositorySnapshot) -> GuiUtils.invokeLaterIfNeeded(
+        () -> {
+          gitMacheteRepositorySnapshot = repositorySnapshot;
+          queueRepositoryUpdateAndModelRefresh();
 
-        if (!discoverRunResult.isSuccess()) {
-          var exception = discoverRunResult.getCause();
-          GuiUtils.invokeLaterIfNeeded(() -> VcsNotifier.getInstance(project).notifyError(
-              getString("string.GitMachete.EnhancedGraphTable.automatic-discover.cant-discover-layout-error-title"),
-              exception.getMessage() != null ? exception.getMessage() : ""), NON_MODAL);
-          return;
-        }
+          VcsNotifier.getInstance(project)
+              .notifyInfo(getString("string.GitMachete.EnhancedGraphTable.automatic-discover.success-message"));
+        },
+        NON_MODAL);
+  }
 
-        var repositorySnapshot = discoverRunResult.get();
-
-        if (repositorySnapshot.getRootBranches().size() == 0) {
-          GuiUtils.invokeLaterIfNeeded(
-              () -> setTextForEmptyTable(
-                  format(getString("string.GitMachete.EnhancedGraphTable.empty-table-text.cant-discover-layout"),
-                      macheteFilePath.toString())),
-              NON_MODAL);
-          return;
-        }
-
-        var branchLayoutWriter = project.getService(BranchLayoutWriterProvider.class).getBranchLayoutWriter();
-        var branchLayout = repositorySnapshot.getBranchLayout().getOrNull();
-
-        if (branchLayout == null) {
-          LOG.error("Can't get branch layout from repository snapshot");
-          return;
-        }
-
-        try {
-          branchLayoutWriter.write(macheteFilePath, branchLayout, /* backupOldLayout */ true);
-
-          GuiUtils.invokeLaterIfNeeded(
-              () -> {
-                gitMacheteRepositorySnapshot = repositorySnapshot;
-                queueRepositoryUpdateAndModelRefresh();
-
-                VcsNotifier.getInstance(project)
-                    .notifyInfo(getString("string.GitMachete.EnhancedGraphTable.automatic-discover.success-message"));
-              },
-              NON_MODAL);
-        } catch (BranchLayoutException exception) {
-          GuiUtils.invokeLaterIfNeeded(() -> VcsNotifier.getInstance(project).notifyError(
-              getString("string.GitMachete.EnhancedGraphTable.automatic-discover.cant-discover-layout-error-title"),
-              exception.getMessage() != null ? exception.getMessage() : ""), NON_MODAL);
-        }
-      }
-    }.queue();
+  @UIEffect
+  private Consumer<Path> getUnsuccessfulDiscoverMacheteFilePathConsumer() {
+    return (Path macheteFilePath) -> GuiUtils.invokeLaterIfNeeded(
+        () -> setTextForEmptyTable(
+            format(getString("string.GitMachete.EnhancedGraphTable.empty-table-text.cant-discover-layout"),
+                macheteFilePath.toString())),
+        NON_MODAL);
   }
 
   @Override
